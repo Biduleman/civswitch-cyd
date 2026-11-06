@@ -7,11 +7,12 @@
 #include "cfg.h"
 #include "config.h"
 #include "hw.h"
+#include "ldn/ldn.h"
 #include "led.h"
 #include "loader.h"
 #include "net.h"
 
-// CivSwitch CYD host - INSTALL flow.
+// CivSwitch CYD host - M6 + BOOTSTRAP (ticket 11): LDN run + mode switching.
 
 static lv_obj_t *scrMenu;
 static lv_obj_t *scrLog;
@@ -29,7 +30,7 @@ static String manifestSource = "unknown";
 static String manifestSha;
 static File runFile;
 
-/* Run-log capture: every loader line is appended to
+/* Run-log capture (ticket 08): every loader line is appended to
  * /runs/run-<millis>.log for the duration of a flow. */
 static void runLogOpen() {
   if (!hw::sdReady()) return;
@@ -170,9 +171,7 @@ static void installClick(lv_event_t *e) {
   (void)e;
   if (flowBusy) return;
 
-  /* click-time loader check, then straight into the install. The installer
-   * wipes all single-player saves and replaces the boot payload - logged
-   * before it runs. */
+  /* click-time loader check: no permanent greyed state, just clear feedback */
   flowBusy = true;
   setFlowEnabled(false);
   lv_label_set_text(flowStatusLabel, "checking for loader...");
@@ -181,7 +180,7 @@ static void installClick(lv_event_t *e) {
   bool live = loader::ping(3000);
   if (!live) {
     uiLogAppend((String("no loader detected at ") + net::targetIp() + ":" +
-                 CONSOLE_PORT + " - bootstrap the console first (Pico or LDN)")
+                 CONSOLE_PORT + " - bootstrap the console first (Pico)")
                     .c_str());
     lv_label_set_text(flowStatusLabel, "no loader");
     lv_obj_set_style_text_color(flowStatusLabel,
@@ -190,12 +189,10 @@ static void installClick(lv_event_t *e) {
     setFlowEnabled(true);
     return;
   }
-  uiLogAppend("loader detected");
-  uiLogAppend("WARNING: this wipes all single-player saves and replaces the "
-              "boot payload");
-  String bootLine = String("boot payload: ") + manifestSource + "  sha256 " +
-                    manifestSha.substring(0, 16);
-  uiLogAppend(bootLine.c_str());
+  uiLogAppend("loader detected - running the installer");
+  /* provenance stays visible (log + run log) even without a confirm step */
+  uiLogAppend((String("INSTALL wipes all single-player saves; boot payload: ") +
+               manifestSource + " (sha256 " + manifestSha + ")").c_str());
   runInstall();
 }
 
@@ -204,9 +201,138 @@ static void backHandler(lv_event_t *e) {
   if (!flowBusy) lv_scr_load(scrMenu);
 }
 
+/* ---- BOOTSTRAP: LDN run + mode switching (ticket 11) ----
+ * Dedicated screen: hold-to-confirm (the installer wipes single-player
+ * saves), then live phases (scan / join / auth / chat / installer chunks),
+ * chunk progress bar, and a reboot back into AP mode on completion. */
+
+static lv_obj_t *scrLdn;
+static lv_obj_t *ldnPhaseLabel;
+static lv_obj_t *ldnStatusLabel;
+static lv_obj_t *ldnBar;
+static lv_obj_t *ldnBarLabel;
+static lv_obj_t *ldnLogLabel;
+static lv_obj_t *ldnBackBtn;
+static String ldnLogText;
+static bool ldnRunning = false;
+
+static void ldnLogAppend(const char *line) {
+  Serial.printf("[ldn] %s\r\n", line);
+  if (runFile) {
+    hw::busForSd();
+    runFile.println(line);
+  }
+  ldnLogText += line;
+  ldnLogText += "\n";
+  while (ldnLogText.length() > 900) ldnLogText.remove(0, ldnLogText.indexOf('\n') + 1);
+  lv_label_set_text(ldnLogLabel, ldnLogText.c_str());
+  lv_obj_scroll_to_y(ldnLogLabel, LV_COORD_MIN, LV_ANIM_OFF);
+}
+
+static void ldnPhaseCb(const char *phase) {
+  lv_label_set_text_fmt(ldnPhaseLabel, "phase: %s", phase);
+  ldnLogAppend((String("[phase] ") + phase).c_str());
+}
+
+static void ldnYieldCb() { hw::lvLoop(); }
+
+static void ldnProgressCb(int done, int total) {
+  if (total <= 0) {
+    lv_obj_add_flag(ldnBar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ldnBarLabel, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_clear_flag(ldnBar, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(ldnBarLabel, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text_fmt(ldnBarLabel, "installer %d/%d chunks", done, total);
+  lv_bar_set_value(ldnBar, done * 100 / total, LV_ANIM_OFF);
+}
+
+static bool ldnPreflight(String *missing) {
+  static const char *files[] = {
+      "/prod.keys",
+      "/install/chat_payload.txt",
+      bundle::TPL_PATH,
+      bundle::APPLY_PATH,
+  };
+  hw::busForSd();
+  for (const char *path : files) {
+    if (!SD.exists(path)) {
+      if (missing->length()) *missing += ", ";
+      *missing += path;
+    }
+  }
+  return missing->length() == 0;
+}
+
+/* Blocks until the whole flow finishes, then reboots: success after ~3 s,
+ * failure after ~15 s (so the error stays readable). The reboot is what
+ * brings the AP back - the LDN run tears the AP down and does not restore
+ * it (the radio is in raw STA mode). */
+static void runLdnBootstrap() {
+  ldnRunning = true;
+  led::set(led::BUSY);
+  lv_obj_add_flag(ldnBackBtn, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(ldnStatusLabel, "dropping AP, joining the lobby...");
+  runLogOpen();
+
+  static String err;
+  bool ok = ldn::bootstrap(ldnLogAppend, ldnPhaseCb, ldnYieldCb,
+                           ldnProgressCb, &err);
+
+  ldnLogAppend(ok ? "BOOTSTRAP DONE - payload installed"
+                  : (String("BOOTSTRAP FAILED: ") + err).c_str());
+  lv_label_set_text(ldnStatusLabel,
+                    ok ? "INSTALL DONE - rebooting into AP mode..."
+                       : (String("FAILED: ") + err).c_str());
+  lv_obj_set_style_text_color(ldnStatusLabel,
+                              ok ? lv_palette_main(LV_PALETTE_GREEN)
+                                 : lv_palette_main(LV_PALETTE_RED),
+                              0);
+  led::set(ok ? led::OK : led::FAIL);
+  runLogClose();
+
+  for (int wait = ok ? 3 : 15; wait > 0; wait--) {
+    lv_label_set_text_fmt(ldnPhaseLabel, "rebooting in %d s...", wait);
+    uint32_t start = millis();
+    while (millis() - start < 1000) hw::lvLoop();
+  }
+  ESP.restart();
+}
+
+static void ldnBackHandler(lv_event_t *e) {
+  (void)e;
+  if (!ldnRunning) lv_scr_load(scrMenu);
+}
+
+static void bootstrapClick(lv_event_t *e) {
+  (void)e;
+  if (flowBusy || ldnRunning) return;
+
+  /* click-time pre-flight: every SD file the run needs */
+  String missing;
+  if (!ldnPreflight(&missing)) {
+    lv_scr_load(scrLog);
+    uiLogAppend((String("BOOTSTRAP: missing on SD: ") + missing).c_str());
+    return;
+  }
+
+  ldnLogText = "";
+  lv_label_set_text(ldnLogLabel, "");
+  lv_obj_add_flag(ldnBar, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(ldnBarLabel, LV_OBJ_FLAG_HIDDEN);
+  lv_scr_load(scrLdn);
+  /* no confirm step: one tap runs the whole bootstrap (user decision -
+   * the pre-flight + INSTALL-wipes-saves notice land in the log) */
+  ldnLogAppend("BOOTSTRAP: this will inject the payload and run the "
+               "installer (wipes single-player saves)");
+  runLdnBootstrap();
+}
+
 static void buildUi(bool sd) {
   scrMenu = lv_obj_create(nullptr);
   scrLog = lv_obj_create(nullptr);
+  scrLdn = lv_obj_create(nullptr);
 
   /* ---- menu screen ---- */
   lv_obj_t *header = lv_label_create(scrMenu);
@@ -272,7 +398,9 @@ static void buildUi(bool sd) {
   if ((int)payloads.size() > 8) {
     lv_obj_t *more = lv_label_create(scrMenu);
     lv_label_set_text_fmt(more, "+%d more on SD", (int)payloads.size() - 8);
-    lv_obj_set_pos(more, 166, 218);
+    lv_obj_set_pos(more, 166, 72); /* right of the SD line; bottom row is the
+                                      INSTALL / BOOTSTRAP button row */
+    lv_obj_set_style_text_color(more, lv_palette_main(LV_PALETTE_GREY), 0);
   }
 
   installBtn = lv_btn_create(scrMenu);
@@ -282,6 +410,51 @@ static void buildUi(bool sd) {
   lv_obj_t *installLabel = lv_label_create(installBtn);
   lv_label_set_text(installLabel, "INSTALL");
   lv_obj_center(installLabel);
+
+  lv_obj_t *bootstrapBtn = lv_btn_create(scrMenu);
+  lv_obj_set_size(bootstrapBtn, 148, 22);
+  lv_obj_set_pos(bootstrapBtn, 166, 214);
+  lv_obj_add_event_cb(bootstrapBtn, bootstrapClick, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *bootstrapLabel = lv_label_create(bootstrapBtn);
+  lv_label_set_text(bootstrapLabel, "BOOTSTRAP (LDN)");
+  lv_obj_center(bootstrapLabel);
+
+  /* ---- LDN bootstrap screen: phases + installer chunks ---- */
+  ldnBackBtn = lv_btn_create(scrLdn);
+  lv_obj_set_size(ldnBackBtn, 64, 28);
+  lv_obj_set_pos(ldnBackBtn, 8, 4);
+  lv_obj_add_event_cb(ldnBackBtn, ldnBackHandler, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *ldnBackLabel = lv_label_create(ldnBackBtn);
+  lv_label_set_text(ldnBackLabel, "back");
+  lv_obj_center(ldnBackLabel);
+
+  ldnPhaseLabel = lv_label_create(scrLdn);
+  lv_label_set_text(ldnPhaseLabel, "ready");
+  lv_obj_set_pos(ldnPhaseLabel, 82, 11);
+  lv_obj_set_style_text_color(ldnPhaseLabel,
+                              lv_palette_main(LV_PALETTE_GREY), 0);
+
+  ldnBar = lv_bar_create(scrLdn);
+  lv_obj_set_size(ldnBar, 230, 14);
+  lv_obj_set_pos(ldnBar, 82, 28);
+  lv_obj_add_flag(ldnBar, LV_OBJ_FLAG_HIDDEN);
+
+  ldnBarLabel = lv_label_create(scrLdn);
+  lv_obj_set_pos(ldnBarLabel, 82, 44);
+  lv_obj_add_flag(ldnBarLabel, LV_OBJ_FLAG_HIDDEN);
+
+  ldnStatusLabel = lv_label_create(scrLdn);
+  lv_label_set_text(ldnStatusLabel, "");
+  lv_obj_set_pos(ldnStatusLabel, 8, 48);
+  lv_obj_set_width(ldnStatusLabel, 304);
+  lv_label_set_long_mode(ldnStatusLabel, LV_LABEL_LONG_WRAP);
+
+  ldnLogLabel = lv_label_create(scrLdn);
+  lv_label_set_text(ldnLogLabel, "");
+  lv_obj_set_width(ldnLogLabel, 304);
+  lv_obj_set_pos(ldnLogLabel, 8, 96);
+  lv_label_set_long_mode(ldnLogLabel, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_color(ldnLogLabel, lv_palette_main(LV_PALETTE_LIME), 0);
 
   /* ---- log screen ---- */
   lv_obj_t *back = lv_btn_create(scrLog);
@@ -342,7 +515,7 @@ void setup() {
   lv_scr_load(scrMenu); /* the built screen must actually become the active one */
   refreshNetLabels();
   if (!ap) lv_obj_set_style_text_color(apLabel, lv_palette_main(LV_PALETTE_RED), 0);
-  Serial.printf("[boot] armed; boot payload: %s\r\n", manifestSource.c_str());
+  Serial.printf("[m4] armed; boot payload: %s\r\n", manifestSource.c_str());
 }
 
 void loop() {

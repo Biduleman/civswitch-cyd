@@ -19,11 +19,20 @@ Output: build/sd/  ->  copy the CONTENTS onto the root of a FAT32 SD card.
   install/stage.hex.payload   source payload name, for the INSTALL screen
   install/tpl_b64.txt     save template base64-encoded (exact length matters)
   install/apply.js        the installer payload with stage + template length spliced
+  install/chat_payload.txt    LDN chat transport (--ldn; needs node + terser)
   manifest.json           stage provenance for the CYD INSTALL screen
 
 The staleness guard: stage.hex.sha256 is the sha256 of the normalized
 payload the stage was built from. build_sd.py re-hashes the payload and
 aborts on a mismatch, so a stale stage can never ship.
+
+--ldn additionally builds install/chat_payload.txt - the LDN **chat
+transport** payload (core.js + the UDP :9027 receiver, terser-minified and
+compressed into the chat-safe chunk format) that the BOOTSTRAP flow injects
+as lobby-chat messages. The splice mirrors SeanHeuc's esp32-ldn-civ7
+tools/make_payload.py byte-for-byte. Requires node on PATH; terser resolves
+from <civswitch>/PicoSwitch/node_modules or tools/node_modules
+(npm install terser).
 """
 import argparse
 import base64
@@ -32,14 +41,93 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 
 LOADER_MAX_BYTES = 500 * 1024
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ---- LDN chat transport (--ldn) ----
+LDN_ENTRY = "        remote_js_loader();"
+LDN_OLD_CREDIT = 'await log("CivSwitch 1.0 by Gezine");'
+LDN_NEW_CREDIT = ('await log("esp32-ldn-civ7 by sean");\n'
+                  '        await log("CivSwitch 1.0 by Gezine");')
 
 
 def fail(msg):
     print("E: " + msg)
     sys.exit(2)
+
+
+def build_chat_payload_lines(civswitch, tools_dir):
+    """Returns the chat-safe payload lines for --ldn.
+
+    Splices tools/udp_loader.js into <civswitch>/core.js (replacing the
+    remote_js_loader() call, + the boot-credit line) exactly like SeanHeuc's
+    esp32-ldn-civ7 tools/make_payload.py, then runs the clone's
+    PicoSwitch/compress.js with MAX bumped 254 -> 1000. One line per chat
+    message; the CYD streams them as NetChat during the bootstrap.
+    """
+    core_path = os.path.join(civswitch, "core.js")
+    compress_path = os.path.join(civswitch, "PicoSwitch", "compress.js")
+    if not os.path.exists(core_path):
+        fail("core.js not found in the CivSwitch clone: %s (--civswitch)" % core_path)
+    if not os.path.exists(compress_path):
+        fail("PicoSwitch/compress.js not found: %s (--civswitch)" % compress_path)
+
+    core = open(core_path, encoding="utf-8").read()
+    snippet_path = os.path.join(tools_dir, "udp_loader.js")
+    if not os.path.exists(snippet_path):
+        fail("vendored udp_loader.js missing: %s" % snippet_path)
+    snippet = open(snippet_path, encoding="utf-8").read()
+
+    if core.count(LDN_ENTRY) != 1:
+        fail("expected exactly one %r in %s (found %d)" %
+             (LDN_ENTRY.strip(), core_path, core.count(LDN_ENTRY)))
+    combined = core.replace(LDN_ENTRY, snippet)
+    if combined.count(LDN_OLD_CREDIT) != 1:
+        fail("expected exactly one boot-credit log line in %s" % core_path)
+    combined = combined.replace(LDN_OLD_CREDIT, LDN_NEW_CREDIT)
+
+    compress_src = open(compress_path, encoding="utf-8").read()
+    if compress_src.count("const MAX = 254;") != 1:
+        fail("unexpected %s (no 'const MAX = 254;' to bump to 1000)" % compress_path)
+    compress_src = compress_src.replace("const MAX = 254;", "const MAX = 1000;")
+
+    node_paths = [p for p in (os.path.join(civswitch, "PicoSwitch", "node_modules"),
+                              os.path.join(tools_dir, "node_modules"))
+                  if os.path.isdir(p)]
+    if not node_paths:
+        fail("terser not found - run 'npm install terser' in %s or in %s"
+             % (os.path.dirname(compress_path), tools_dir))
+
+    tmp = tempfile.mkdtemp(prefix="chat_payload_")
+    try:
+        os.makedirs(os.path.join(tmp, "PicoSwitch"))
+        with open(os.path.join(tmp, "core.js"), "w", encoding="utf-8",
+                  newline="") as fh:
+            fh.write(combined)
+        with open(os.path.join(tmp, "PicoSwitch", "compress.js"), "w",
+                  encoding="utf-8", newline="") as fh:
+            fh.write(compress_src)
+        env = dict(os.environ)
+        env["NODE_PATH"] = os.pathsep.join(node_paths)
+        r = subprocess.run(["node", "compress.js"],
+                           cwd=os.path.join(tmp, "PicoSwitch"),
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            fail("compress.js failed: %s" % (r.stderr.strip() or r.stdout.strip()))
+        print(r.stdout.strip())
+        lines = [l for l in open(os.path.join(tmp, "PicoSwitch", "payload.txt"),
+                                 encoding="ascii").read().splitlines() if l.strip()]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    longest = max(len(l) for l in lines)
+    if longest > 1000:
+        fail("chat payload line exceeds the chat-safe limit: %d chars" % longest)
+    return lines
 
 
 def main():
@@ -56,6 +144,10 @@ def main():
                          "(default: <civswitch>/payloads)")
     ap.add_argument("--out", default=os.path.join("build", "sd"),
                     help="output folder to (re)create (default: build/sd)")
+    ap.add_argument("--ldn", action="store_true",
+                    help="also build install/chat_payload.txt - the LDN chat "
+                         "transport payload for the BOOTSTRAP flow (needs "
+                         "node + terser)")
     args = ap.parse_args()
 
     civswitch = os.path.abspath(args.civswitch)
@@ -109,6 +201,12 @@ def main():
     if os.path.exists(name_path):
         source_payload = open(name_path, encoding="ascii").read().strip() or None
 
+    # ---- LDN chat transport: build BEFORE wiping the bundle (fail fast)
+    chat_lines = None
+    if args.ldn:
+        chat_lines = build_chat_payload_lines(civswitch, HERE)
+        print("chat payload: %d lines (LDN chat transport)" % len(chat_lines))
+
     # ---- 2. template: pristine CIV7 save, base64-encoded (binary -> loader text protocol)
     if not os.path.exists(tpl_path):
         fail("save template not found: %s" % tpl_path)
@@ -158,6 +256,10 @@ def main():
     with open(os.path.join(out_dir, "install", "apply.js"), "w",
               encoding="ascii", newline="\n") as fh:
         fh.write(apply_js)
+    if chat_lines is not None:
+        with open(os.path.join(out_dir, "install", "chat_payload.txt"), "w",
+                  encoding="ascii", newline="\n") as fh:
+            fh.write("\n".join(chat_lines) + "\n")
     manifest = {
         "source_payload": source_payload,
         "stage_sha256": stage_sha,
@@ -165,6 +267,8 @@ def main():
         "tpl_b64_len": len(tpl_b64),
         "tpl_chunks": chunks,
     }
+    if chat_lines is not None:
+        manifest["chat_payload_lines"] = len(chat_lines)
     with open(os.path.join(out_dir, "manifest.json"), "w",
               encoding="ascii", newline="\n") as fh:
         json.dump(manifest, fh, indent=2)
@@ -172,6 +276,9 @@ def main():
 
     print()
     print("bundle written: %s" % out_dir)
+    if chat_lines is not None:
+        print("LDN chat transport: install/chat_payload.txt (%d messages)"
+              % len(chat_lines))
     print("copy the CONTENTS of this folder onto the root of a FAT32 SD card.")
     print("boot payload: %s (re-run precompute_stage.js + this script to change it)"
           % (source_payload or "unknown"))
