@@ -15,20 +15,15 @@
 
 static lv_obj_t *scrMenu;
 static lv_obj_t *scrLog;
-static lv_obj_t *scrConfirm;
 static lv_obj_t *apLabel;
 static lv_obj_t *stationLabel;
 static lv_obj_t *installBtn;
 static lv_obj_t *flowStatusLabel; /* lives on the log screen */
-static lv_obj_t *provLabel;
-static lv_obj_t *holdBtn;
-static lv_obj_t *holdLabel;
 static lv_obj_t *bar;
 static lv_obj_t *barLabel;
 static lv_obj_t *logLabel;
 static std::vector<lv_obj_t *> payloadButtons;
 static bool flowBusy = false;
-static uint32_t holdStart = 0;
 static String logText;
 static String manifestSource = "unknown";
 static String manifestSha;
@@ -175,7 +170,9 @@ static void installClick(lv_event_t *e) {
   (void)e;
   if (flowBusy) return;
 
-  /* click-time loader check: no permanent greyed state, just clear feedback */
+  /* click-time loader check, then straight into the install. The installer
+   * wipes all single-player saves and replaces the boot payload - logged
+   * before it runs. */
   flowBusy = true;
   setFlowEnabled(false);
   lv_label_set_text(flowStatusLabel, "checking for loader...");
@@ -184,7 +181,7 @@ static void installClick(lv_event_t *e) {
   bool live = loader::ping(3000);
   if (!live) {
     uiLogAppend((String("no loader detected at ") + net::targetIp() + ":" +
-                 CONSOLE_PORT + " - bootstrap the console first (Pico)")
+                 CONSOLE_PORT + " - bootstrap the console first (Pico or LDN)")
                     .c_str());
     lv_label_set_text(flowStatusLabel, "no loader");
     lv_obj_set_style_text_color(flowStatusLabel,
@@ -193,26 +190,13 @@ static void installClick(lv_event_t *e) {
     setFlowEnabled(true);
     return;
   }
-  uiLogAppend("loader detected - confirm the install");
-
-  lv_obj_t *prov = lv_label_create(scrConfirm);
-  /* rebuilt fresh each visit so the latest manifest is shown */
-  lv_label_set_text_fmt(prov,
-                        "This INSTALL will:\n"
-                        "- WIPE all single-player saves\n"
-                        "- replace the boot payload with:\n"
-                        "  %s\n"
-                        "  sha256 %.16s...\n"
-                        "Hold the button below to confirm.",
-                        manifestSource.c_str(), manifestSha.c_str());
-  lv_obj_set_pos(prov, 8, 8);
-  lv_obj_set_width(prov, 304);
-  lv_obj_set_style_text_color(prov, lv_palette_main(LV_PALETTE_RED), 0);
-  holdStart = 0;
-  lv_label_set_text(holdLabel, "HOLD 2s TO INSTALL");
-  lv_scr_load(scrConfirm);
-  flowBusy = false;
-  setFlowEnabled(true);
+  uiLogAppend("loader detected");
+  uiLogAppend("WARNING: this wipes all single-player saves and replaces the "
+              "boot payload");
+  String bootLine = String("boot payload: ") + manifestSource + "  sha256 " +
+                    manifestSha.substring(0, 16);
+  uiLogAppend(bootLine.c_str());
+  runInstall();
 }
 
 static void backHandler(lv_event_t *e) {
@@ -220,35 +204,9 @@ static void backHandler(lv_event_t *e) {
   if (!flowBusy) lv_scr_load(scrMenu);
 }
 
-static void confirmBackHandler(lv_event_t *e) {
-  (void)e;
-  holdStart = 0;
-  lv_scr_load(scrMenu);
-}
-
-static void holdHandler(lv_event_t *e) {
-  if (flowBusy) return;
-  lv_event_code_t code = lv_event_get_code(e);
-  if (code == LV_EVENT_PRESSING) {
-    if (holdStart == 0) holdStart = millis();
-    uint32_t held = millis() - holdStart;
-    lv_label_set_text_fmt(holdLabel, "keep holding... %lu ms",
-                          (unsigned long)held);
-    if (held >= 2000) {
-      holdStart = 0;
-      lv_label_set_text(holdLabel, "confirmed");
-      runInstall();
-    }
-  } else if (code == LV_EVENT_RELEASED) {
-    holdStart = 0;
-    lv_label_set_text(holdLabel, "HOLD 2s TO INSTALL");
-  }
-}
-
 static void buildUi(bool sd) {
   scrMenu = lv_obj_create(nullptr);
   scrLog = lv_obj_create(nullptr);
-  scrConfirm = lv_obj_create(nullptr);
 
   /* ---- menu screen ---- */
   lv_obj_t *header = lv_label_create(scrMenu);
@@ -324,24 +282,6 @@ static void buildUi(bool sd) {
   lv_obj_t *installLabel = lv_label_create(installBtn);
   lv_label_set_text(installLabel, "INSTALL");
   lv_obj_center(installLabel);
-
-  /* ---- confirm screen ---- */
-  holdBtn = lv_btn_create(scrConfirm);
-  lv_obj_set_size(holdBtn, 200, 56);
-  lv_obj_align(holdBtn, LV_ALIGN_BOTTOM_MID, 0, -60);
-  lv_obj_add_event_cb(holdBtn, holdHandler, LV_EVENT_PRESSING, nullptr);
-  lv_obj_add_event_cb(holdBtn, holdHandler, LV_EVENT_RELEASED, nullptr);
-  holdLabel = lv_label_create(holdBtn);
-  lv_label_set_text(holdLabel, "HOLD 2s TO INSTALL");
-  lv_obj_center(holdLabel);
-
-  lv_obj_t *cBack = lv_btn_create(scrConfirm);
-  lv_obj_set_size(cBack, 80, 30);
-  lv_obj_align(cBack, LV_ALIGN_BOTTOM_MID, 0, -8);
-  lv_obj_add_event_cb(cBack, confirmBackHandler, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t *cBackLabel = lv_label_create(cBack);
-  lv_label_set_text(cBackLabel, "cancel");
-  lv_obj_center(cBackLabel);
 
   /* ---- log screen ---- */
   lv_obj_t *back = lv_btn_create(scrLog);

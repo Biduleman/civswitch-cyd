@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 
 /* ---- Display (ILI9341, landscape via setRotation(1): 320x240) ---- */
 #define TFT_ROTATION 1
