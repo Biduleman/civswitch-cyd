@@ -1,0 +1,20 @@
+# Build output
+.pio/
+build/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Archives / temp files
+*.tar.gz
+*.zip
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
